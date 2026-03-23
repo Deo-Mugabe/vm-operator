@@ -29,12 +29,43 @@ type VmFleetSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	
+	// controller-gen reads +k.. and bakes them into the CRD YAML as OpenAPI validation rules. 
+	
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	Replicas int32 `json:"replicas"`
 
-	// foo is an example field of VmFleet. Edit vmfleet_types.go to remove/update
-	// +optional
-	Foo *string `json:"foo,omitempty"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=4
+	CPU int32 `json:"cpu"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=8
+	Memory int32 `json:"memory"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=100
+	DiskGB int32 `json:"diskGB"`
+
+	// +kubebuilder:validation:Required
+	Template string `json:"template"`
 }
 
+type FleetPhase string
+
+const (
+	RunningFleetPhase FleetPhase = "RUNNING"
+	PendingFleetPhase FleetPhase = "PENDING"
+	ErrorFleetPhase   FleetPhase = "ERROR"
+)
+
+
+//Status is what the operator writes back to Kubernetes after doing work. 
+// It's how you communicate "here's what actually exists" vs what was requested in the Spec.
 // VmFleetStatus defines the observed state of VmFleet.
 type VmFleetStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -51,15 +82,26 @@ type VmFleetStatus struct {
 	// - "Progressing": the resource is being created or updated
 	// - "Degraded": the resource failed to reach or maintain its desired state
 	//
-	// The status of each condition is one of True, False, or Unknown.
-	// +listType=map
-	// +listMapKey=type
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	// +kubebuilder:validation:Optional
+	Phase           FleetPhase `json:"phase,omitempty"`
+	CurrentReplicas *int32     `json:"currentReplicas,omitempty"`
+	DesiredReplicas int32      `json:"desiredReplicas"`
+	LastMessage     string     `json:"lastMessage,omitempty"`
 }
-
+// printcolumns These define what columns appear when you run kubectl get vmfleets
+//
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName={"vf"}
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Current",type=integer,JSONPath=`.status.currentReplicas`
+// +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.spec.replicas`
+// +kubebuilder:printcolumn:name="CPU",type=integer,JSONPath=`.spec.cpu`
+// +kubebuilder:printcolumn:name="Memory",type=integer,JSONPath=`.spec.memory`
+// +kubebuilder:printcolumn:name="DiskGB",type=integer,JSONPath=`.spec.diskGB`
+// +kubebuilder:printcolumn:name="Template",type=string,JSONPath=`.spec.template`
+// +kubebuilder:printcolumn:name="Message",type=string,JSONPath=`.status.lastMessage`
+
 
 // VmFleet is the Schema for the vmfleets API
 type VmFleet struct {
@@ -67,15 +109,15 @@ type VmFleet struct {
 
 	// metadata is a standard object metadata
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitzero"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	// spec defines the desired state of VmFleet
+	// spec defines the desired state of VmFleet - what you want
 	// +required
-	Spec VmFleetSpec `json:"spec"`
+	Spec VmFleetSpec `json:"spec,omitempty"`
 
-	// status defines the observed state of VmFleet
+	// status defines the observed state of VmFleet -  what exists
 	// +optional
-	Status VmFleetStatus `json:"status,omitzero"`
+	Status VmFleetStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -83,7 +125,7 @@ type VmFleet struct {
 // VmFleetList contains a list of VmFleet
 type VmFleetList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitzero"`
+	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []VmFleet `json:"items"`
 }
 
