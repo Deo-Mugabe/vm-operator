@@ -17,23 +17,24 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
+	"net/url"
 	"os"
 
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
-
+	"github.com/pkg/errors"
+	"github.com/vmware/govmomi"
+	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/vim25/soap"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	vmv1alpha1 "vmfleet/operator/api/v1alpha1"
 	"vmfleet/operator/internal/controller"
@@ -54,151 +55,167 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// ── Flags
+
 	var metricsAddr string
-	var metricsCertPath, metricsCertName, metricsCertKey string
-	var webhookCertPath, webhookCertName, webhookCertKey string
-	var enableLeaderElection bool
 	var probeAddr string
-	var secureMetrics bool
-	var enableHTTP2 bool
-	var tlsOpts []func(*tls.Config)
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
-		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	var enableLeaderElection bool
+	var insecure bool
+
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080",
+		"The address the metrics endpoint binds to. Use 0 to disable.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
+		"The address the health probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", true,
-		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
-	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
-		"The directory that contains the metrics server certificate.")
-	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
-	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	opts := zap.Options{
-		Development: true,
-	}
+		"Enable leader election. Ensures only one active controller manager.")
+	flag.BoolVar(&insecure, "insecure", false,
+		"Skip vCenter TLS certificate validation. Use for self-signed certs.")
+
+	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("Disabling HTTP/2")
-		c.NextProtos = []string{"http/1.1"}
+	// ── vCenter connection ─────────────────────────────────────────────────
+	// We read vCenter credentials from environment variables.
+	// This keeps secrets out of the command line and config files.
+
+	vcHost := os.Getenv("VC_HOST")
+	vcUser := os.Getenv("VC_USER")
+	vcPass := os.Getenv("VC_PASS")
+
+	if vcHost == "" || vcUser == "" || vcPass == "" {
+		setupLog.Error(
+			errors.New("missing vCenter credentials"),
+			"VC_HOST, VC_USER and VC_PASS environment variables must all be set",
+		)
+		os.Exit(1)
 	}
 
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	vc, err := newVCenterClient(ctx, vcHost, vcUser, vcPass, insecure)
+	if err != nil {
+		setupLog.Error(err, "failed to connect to vCenter")
+		os.Exit(1)
 	}
+	setupLog.Info("connected to vCenter", "host", vcHost)
 
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
+	// ── vCenter inventory setup ────────────────────────────────────────────
+	// The Finder navigates the vCenter inventory tree by path.
+	// We set a default datacenter so paths like "/DC0/vm/..." work.
+
+	finder := find.NewFinder(vc.Client)
+
+	dc, err := finder.DefaultDatacenter(ctx)
+	if err != nil {
+		setupLog.Error(err, "could not find default datacenter in vCenter")
+		os.Exit(1)
 	}
+	finder.SetDatacenter(dc)
+	setupLog.Info("using datacenter", "datacenter", dc.Name())
 
-	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
-
-		webhookServerOptions.CertDir = webhookCertPath
-		webhookServerOptions.CertName = webhookCertName
-		webhookServerOptions.KeyName = webhookCertKey
+	// The ResourcePool is where new VMs are placed when cloned.
+	// We use the explicit path we know vcsim exposes.
+	rp, err := finder.ResourcePool(ctx, "/DC0/host/DC0_H0/Resources")
+	if err != nil {
+		setupLog.Error(err, "could not find resource pool")
+		os.Exit(1)
 	}
+	setupLog.Info("using resource pool", "pool", rp.InventoryPath)
 
-	webhookServer := webhook.NewServer(webhookServerOptions)
-
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-	// More info:
-	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/metrics/server
-	// - https://book.kubebuilder.io/reference/metrics.html
-	metricsServerOptions := metricsserver.Options{
-		BindAddress:   metricsAddr,
-		SecureServing: secureMetrics,
-		TLSOpts:       tlsOpts,
-	}
-
-	if secureMetrics {
-		// FilterProvider is used to protect the metrics endpoint with authn/authz.
-		// These configurations ensure that only authorized users and service accounts
-		// can access the metrics endpoint. The RBAC are configured in 'config/rbac/kustomization.yaml'. More info:
-		// https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.1/pkg/metrics/filters#WithAuthenticationAndAuthorization
-		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
-	}
-
-	// If the certificate is not specified, controller-runtime will automatically
-	// generate self-signed certificates for the metrics server. While convenient for development and testing,
-	// this setup is not recommended for production.
-	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
-	if len(metricsCertPath) > 0 {
-		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
-			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
-
-		metricsServerOptions.CertDir = metricsCertPath
-		metricsServerOptions.CertName = metricsCertName
-		metricsServerOptions.KeyName = metricsCertKey
-	}
+	// ── Manager ────────────────────────────────────────────────────────────
+	// The manager owns the reconcile loop, metrics server, and health checks.
+	// It reads kubeconfig from the KUBECONFIG env var or ~/.kube/config.
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "7d641e05.vm.operator.io",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		LeaderElectionID:       "vmfleet.vm.operator.io",
 	})
 	if err != nil {
-		setupLog.Error(err, "Failed to start manager")
+		setupLog.Error(err, "failed to create manager")
 		os.Exit(1)
 	}
 
-	if err := (&controller.VmFleetReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+	// ── Wire the reconciler ────────────────────────────────────────────────
+	// We inject all dependencies into the reconciler here.
+	// This is called dependency injection — the reconciler never creates
+	// its own vCenter client, it receives one from main.
+
+	if err = (&controller.VmFleetReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		VC:           vc,
+		Finder:       finder,
+		ResourcePool: rp,
+		Log:          ctrl.Log.WithName("controllers").WithName("VmFleet"),
 	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "Failed to create controller", "controller", "VmFleet")
+		setupLog.Error(err, "failed to create VmFleet controller")
 		os.Exit(1)
 	}
-	// +kubebuilder:scaffold:builder
+
+	// ── Health checks ──────────────────────────────────────────────────────
+	// Kubernetes uses these endpoints to know if the operator is alive.
+	// /healthz — is the process running?
+	// /readyz  — is it ready to handle requests?
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "Failed to set up health check")
+		setupLog.Error(err, "failed to set up health check")
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "Failed to set up ready check")
+		setupLog.Error(err, "failed to set up ready check")
 		os.Exit(1)
 	}
 
-	setupLog.Info("Starting manager")
+	// ── Start ──────────────────────────────────────────────────────────────
+	// mgr.Start blocks until Ctrl+C or SIGTERM.
+	// ctrl.SetupSignalHandler returns a context that gets cancelled on signal.
+
+	setupLog.Info("starting VmFleet operator")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "Failed to run manager")
+		setupLog.Error(err, "failed to run manager")
 		os.Exit(1)
+	}
+}
+// newVCenterClient creates and returns an authenticated govmomi client.
+// It parses the URL, attaches credentials, and connects to vCenter.
+func newVCenterClient(ctx context.Context, host, user, pass string, insecure bool) (*govmomi.Client, error) {
+	// soap.ParseURL understands vCenter URL formats
+	u, err := soap.ParseURL(host)
+	if err != nil || u == nil {
+		return nil, fmt.Errorf("could not parse vCenter URL %q: %w", host, err)
+	}
+
+	// attach credentials to the URL
+	u.User = url.UserPassword(user, pass)
+
+	// disable TLS verification for self-signed certs (vcsim, lab environments)
+	if insecure {
+		http := u.Scheme == "https"
+		_ = http
+	}
+
+	client, err := govmomi.NewClient(ctx, u, insecure)
+	if err != nil {
+		return nil, fmt.Errorf("could not connect to vCenter at %q: %w", host, err)
+	}
+
+	return client, nil
+}
+
+// tlsConfig returns a TLS config with optional insecure mode.
+// Kept here for reference — govmomi.NewClient handles this internally
+// when insecure=true is passed.
+func tlsConfig(insecure bool) *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: insecure, //nolint:gosec
 	}
 }
