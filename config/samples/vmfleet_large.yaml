@@ -1,0 +1,13 @@
+apiVersion: vm.vm.operator.io/v1alpha1
+kind: VmFleet
+metadata:
+  name: large-fleet
+  namespace: default
+  labels:
+    app: vmfleet-large
+spec:
+  replicas: 4
+  cpu: 4
+  memory: 8
+  diskGB: 50
+  template: vm-operator-template

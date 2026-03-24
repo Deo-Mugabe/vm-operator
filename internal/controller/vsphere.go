@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"strings"
 
@@ -119,10 +118,6 @@ func cloneVM(
 		Config: &types.VirtualMachineConfigSpec{
 			NumCPUs:  spec.CPU,
 			MemoryMB: int64(1024 * spec.Memory),
-			// Note: DiskGB would normally be set via disk reconfigure
-			// after clone — vCenter does not support it directly in CloneSpec
-			// We store it in the spec for future implementation
-			Annotation: fmt.Sprintf("diskGB=%d", spec.DiskGB),
 		},
 		PowerOn: true,
 	}
@@ -194,6 +189,7 @@ func deleteFleetFolder(ctx context.Context, folder *object.Folder) error {
 
 // limiter is a simple concurrency limiter using a buffered channel.
 // It ensures we never run more than N operations against vCenter at once.
+// to avoid hammering vCenter with too many parallel API calls
 type limiter struct {
 	ch chan struct{}
 }

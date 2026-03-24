@@ -1,0 +1,22 @@
+apiVersion: vm.vm.operator.io/v1alpha1
+kind: VmFleet
+metadata:
+  name: my-fleet
+  namespace: default
+  labels:
+    app: vmfleet-sample
+spec:
+  # number of VMs to maintain in this fleet
+  replicas: 2
+
+  # vCPUs per VM (min: 1, max: 4)
+  cpu: 2
+
+  # RAM per VM in GB (min: 1, max: 8)
+  memory: 2
+
+  # disk size per VM in GB (min: 10, max: 100)
+  diskGB: 20
+
+  # name of the VM template in vCenter to clone from
+  template: vm-operator-template

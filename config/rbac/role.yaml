@@ -1,11 +1,32 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: vm-operator
-    app.kubernetes.io/managed-by: kustomize
-  name: manager-role
+  name: vmfleet-operator-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - vm.vm.operator.io
+  resources:
+  - vmfleets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - vm.vm.operator.io
+  resources:
+  - vmfleets/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - vm.vm.operator.io
+  resources:
+  - vmfleets/status
+  verbs:
+  - get
+  - patch
+  - update
